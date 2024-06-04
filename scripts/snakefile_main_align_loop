@@ -1,0 +1,236 @@
+# Author: Kate Johnson with rules taken from https://www.biostars.org/p/394498/, https://snakemake-wrappers.readthedocs.io/en/stable/wrappers/fgbio/annotatebamwithumis.html
+# module load snakemake/6.12.3
+# snakemake -c4 --use-envmodules -s snakefile_main_align
+
+VERSION = 1.5
+
+configfile: "config_align.yaml"
+
+import re
+
+FASTQ, = glob_wildcards(config["params"]["reads"] + "/" + config["params"]["begin1"] + "{sample}" + config["params"]["ending1"])
+SAMPLES = sorted(set([x for x in FASTQ if "Undetermined" not in x]))
+SEGMENTS = config["timo_params"]["segments"]
+
+#print(SEGMENTS)
+#print(FASTQ)
+print(SAMPLES)
+
+wildcard_constraints:
+    sample='|'.join([re.escape(x) for x in SAMPLES])
+
+rule all:
+    input:
+        #expand(config["params"]["output"] + "tagged/{sample}_tag_1.fq", sample=SAMPLES),
+        #expand(config["params"]["output"] + "tagged/{sample}_tag_2.fq", sample=SAMPLES),
+        expand(config["params"]["output"] + "unmapped/{sample}.unmapped.bam", sample = SAMPLES),
+        #expand(config["params"]["output"] + "trimmed/{sample}_trimmed_1.fq", sample=SAMPLES),
+        #expand(config["params"]["output"] + "trimmed/{sample}.unpair_trimmed_1.fq", sample=SAMPLES),
+        #expand(config["params"]["output"] + "trimmed/{sample}_trimmed_2.fq", sample=SAMPLES),
+        #expand(config["params"]["output"] + "trimmed/{sample}.unpair_trimmed_2.fq", sample=SAMPLES),
+        expand(config["params"]["output"] + "mapped/{sample}.mapped.bam", sample = SAMPLES),
+        #expand(config["params"]["output"] + "bamfiles/bam/{sample}.bwa.bam", sample=SAMPLES),
+        expand(config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".sorted.bwa.bam", sample=SAMPLES),
+        expand(config["params"]["output"] + "bamfiles/grouped/{sample}." + config["params"]["strain"].upper() + ".grouped.bwa.bam", sample=SAMPLES),
+        expand(config["params"]["output"] + "bamfiles/grouped/{sample}." + config["params"]["strain"].upper() + ".con.bwa.bam", sample=SAMPLES),
+        expand(config["params"]["output"] + "consensus_fq/{sample}_consensus_1.fq", sample=SAMPLES),
+        expand(config["params"]["output"] + "consensus_fq/{sample}_consensus_2.fq", sample=SAMPLES),
+        expand(config["params"]["output"] + "bamfiles/sorted/{sample}.realigned.bwa.bam", sample = SAMPLES),
+        #expand(config["params"]["output"] + "bamfiles/bam/{sample}.bwa.anno.bam", sample = SAMPLES),
+        #expand(config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".fixed.bwa.bam", sample = SAMPLES),
+        expand(config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".mate.bwa.bam", sample = SAMPLES),
+        expand(config["params"]["output"] + "FILES/fullvarlist/{sample}." + config["params"]["strain"].upper() + ".{segment}." + config["timo_params"]["freq_cutoff"] + ".snplist.csv", sample=SAMPLES, segment=SEGMENTS),
+
+
+
+rule fastq_to_ubam:
+    """Generates a uBam from R1 and R2 fastq files."""
+    input:
+        r1 = config["params"]["reads"] + "/" + config["params"]["begin1"] + "{sample}" + config["params"]["ending1"],
+        r2 = config["params"]["reads"] + "/" + config["params"]["begin2"] + "{sample}" + config["params"]["ending2"],
+    params:
+        rs1 = "5M25S+T",
+        rs2 = "5M25S+T",
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    output:
+        bam = config["params"]["output"] + "unmapped/{sample}.unmapped.bam",
+    group: "align"
+    envmodules:
+        config["mod_params"]["fgbio_mod"]
+    shell:
+        """
+        java -jar {params.fgbio_jar} FastqToBam \
+            --input {input.r1} {input.r2} \
+            --read-structures {params.rs1} {params.rs2} \
+            --sample {wildcards.sample} \
+            --library {wildcards.sample} \
+            --output {output.bam}
+        """
+
+rule align_bam:
+    """Takes an unmapped BAM and generates an aligned BAM using bwa and ZipperBams."""
+    input:
+        bam = config["params"]["output"] + "unmapped/{sample}.unmapped.bam",
+        ref=config["params"]["ref"],
+    output:
+        out_bam = config["params"]["output"] + "mapped/{sample}.mapped.bam"
+    threads:
+        8
+    group: "align"
+    params: 
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    envmodules:
+        config["mod_params"]["samtools_mod"],
+        config["mod_params"]["bwa"],
+        config["mod_params"]["fgbio_mod"]
+    shell:
+        """
+        samtools fastq {input.bam} | bwa mem -t {threads} -p {input.ref} - | java -jar {params.fgbio_jar} --compression 1 ZipperBams \
+               --unmapped {input.bam} \
+               --ref {input.ref} \
+               --output {output.out_bam} \
+               --tags-to-reverse Consensus \
+               --tags-to-revcomp Consensus
+        """
+
+rule sort:
+    """ sorts the bam file by using the queryname and SortBam in fgbio"""
+    input:
+        bwa_bam=config["params"]["output"] + "mapped/{sample}.mapped.bam"
+    output:
+        bwa_sort_bam=config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".sorted.bwa.bam"
+    group: "align"
+    envmodules:
+        config["mod_params"]["samtools_mod"],
+        config["mod_params"]["fgbio_mod"]
+    params: 
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    shell:
+        """
+        java -jar {params.fgbio_jar} SortBam -i {input.bwa_bam} -s Queryname -o {output.bwa_sort_bam}
+        """
+
+rule SetMateInfo: 
+    """ Sets mate information for the reads using the sorted bam file (necessary for grouping umis)"""
+    input:
+        ref=config["params"]["ref"],
+        bwa_sort_bam=config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".sorted.bwa.bam"
+    output:
+        mate_bam=config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".mate.bwa.bam"
+    group: "align"
+    envmodules:
+        config["mod_params"]["samtools_mod"],
+        config["mod_params"]["fgbio_mod"]
+    params: 
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    shell:
+        """
+        java -jar {params.fgbio_jar} SetMateInformation -r {input.ref} -i {input.bwa_sort_bam} -o {output.mate_bam}
+        """
+
+
+rule GroupReadsByUmi:
+    """ groups the reads with the same umi and mapping location - this step filters a signficant amount of data given the default settings """
+    input: 
+        bwa_sort_bam=config["params"]["output"] + "bamfiles/sorted/{sample}." + config["params"]["strain"].upper() + ".mate.bwa.bam"
+    output:
+        grouped_bam=config["params"]["output"] + "bamfiles/grouped/{sample}." + config["params"]["strain"].upper() + ".grouped.bwa.bam"
+    group: "align"
+    envmodules:
+        config["mod_params"]["fgbio_mod"]
+    params:
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    shell:
+        """
+        java -jar {params.fgbio_jar} GroupReadsByUmi -i {input.bwa_sort_bam} -s adjacency -o {output.grouped_bam}
+        """
+
+rule CallMolecularConsensusReads:
+    """ the alignment is sorted and the consensus of the UMI reads is called and output as a consensus bam file"""
+    input:
+        grouped_bam=config["params"]["output"] + "bamfiles/grouped/{sample}." + config["params"]["strain"].upper() + ".grouped.bwa.bam"
+    output:
+        conBam=config["params"]["output"] + "bamfiles/grouped/{sample}." + config["params"]["strain"].upper() + ".con.bwa.bam"
+    group: "align"
+    envmodules:
+        config["mod_params"]["fgbio_mod"],
+    params: 
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    shell:
+        """
+        java -jar {params.fgbio_jar} SortBam -s TemplateCoordinate -i {input.grouped_bam} -o /dev/stdout |  java -jar {params.fgbio_jar} CallMolecularConsensusReads -m 30 -M 1 -i /dev/stdin -o {output.conBam}
+        """
+
+rule FilterConsensusReads:
+    """ the consensus bam file is filtered and then used to pull out the necessary reads that will then be used to map again """
+    input:
+        ref=config["params"]["ref"],
+        conBam=config["params"]["output"] + "bamfiles/grouped/{sample}." + config["params"]["strain"].upper() + ".con.bwa.bam"
+    output:
+        R1_consensus=config["params"]["output"] + "consensus_fq/{sample}_consensus_1.fq",
+        R2_consensus=config["params"]["output"] + "consensus_fq/{sample}_consensus_2.fq"
+    threads:
+        8
+    group: "align"
+    params: 
+        fgbio_jar=config["mod_params"]["fbio_jar"],
+    envmodules:
+        config["mod_params"]["fgbio_mod"],
+        config["mod_params"]["samtools_mod"],
+    shell:
+        """
+        java -jar {params.fgbio_jar} FilterConsensusReads -i {input.conBam} -o /dev/stdout -r {input.ref} -M 1 -N 30 -E 0.010 \
+        | samtools sort -@ 6 -n \
+        | samtools fastq -1 {output.R1_consensus} -2 {output.R2_consensus} -
+        """
+
+rule AlignConsenus:
+    """ the consensus reads are aligned to the reference using bwa and sorted and indexed """
+    input:
+        ref=config["params"]["ref"],
+        R1_consensus=config["params"]["output"] + "consensus_fq/{sample}_consensus_1.fq",
+        R2_consensus=config["params"]["output"] + "consensus_fq/{sample}_consensus_2.fq"
+    output:
+        bwa_bam=config["params"]["output"] + "bamfiles/sorted/{sample}.realigned.bwa.bam"
+    threads:
+        8
+    group: "align"
+    envmodules:
+        config["mod_params"]["bwa"],
+        config["mod_params"]["samtools_mod"],
+    shell:
+        """
+        bwa mem -t {threads} {input.ref} {input.R1_consensus} {input.R2_consensus}\
+        | samtools sort -@6 -o {output.bwa_bam} 
+
+        samtools index {output.bwa_bam}
+        """
+
+rule timo:
+    """ the final bamfile is used to call minor variants using timo """ 
+    input:
+        ref=config["params"]["ref"],
+        rmd_bam=config["params"]["output"] + "bamfiles/sorted/{sample}.realigned.bwa.bam"
+    output:
+        snplist_files = ["{0}.{1}.{2}".format(config["params"]["output"] + "FILES/fullvarlist/{sample}." + config["params"]["strain"].upper(), s, config["timo_params"]["freq_cutoff"] + ".snplist.csv") for s in SEGMENTS]
+    group: "align"
+    params:
+        strain=config["params"]["strain"].upper(),
+        freq_cutoff = config["timo_params"]["freq_cutoff"],
+        cov_cutoff = config["timo_params"]["cov_cutoff"],
+        script_dir=config["params"]["script_dir"],
+        env_path=config["params"]["venv_path"],
+        timo_output=config["params"]["output"]+ "FILES/fullvarlist/",
+    shell:
+        """
+        source {params.env_path}
+
+        python3 {params.script_dir}timo.v4.py \
+            --strain {params.strain} \
+            --infile {input.rmd_bam} \
+            --ref {input.ref} \
+            --cutoff {params.freq_cutoff} \
+            --covercutoff {params.cov_cutoff} \
+            --outputdir {params.timo_output}
+        """
+
